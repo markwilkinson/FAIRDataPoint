@@ -24,6 +24,22 @@ package org.fairdatateam.fairdatapoint.config;
 
 import lombok.extern.slf4j.Slf4j;
 import org.fairdatateam.fairdatapoint.config.properties.RepositoryProperties;
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpEntityEnclosingRequest;
+import org.apache.http.HttpRequest;
+import org.apache.http.HttpRequestInterceptor;
+import org.apache.http.NameValuePair;
+import org.apache.http.auth.AuthScope;
+import org.apache.http.auth.UsernamePasswordCredentials;
+import org.apache.http.client.CredentialsProvider;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.entity.UrlEncodedFormEntity;
+import org.apache.http.client.utils.URLEncodedUtils;
+import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.message.BasicNameValuePair;
+import org.apache.http.protocol.HttpContext;
+import org.apache.http.util.EntityUtils;
 import org.eclipse.rdf4j.repository.Repository;
 import org.eclipse.rdf4j.repository.RepositoryException;
 import org.eclipse.rdf4j.repository.config.RepositoryConfigException;
@@ -41,6 +57,11 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.fairdatateam.fairdatapoint.util.HttpUtil.removeLastSlash;
 
@@ -61,6 +82,7 @@ public class RepositoryConfig {
             case RepositoryProperties.TYPE_ALLEGRO -> getAgraphRepository();
             case RepositoryProperties.TYPE_GRAPHDB -> getGraphDBRepository();
             case RepositoryProperties.TYPE_BLAZEGRAPH -> getBlazeGraphRepository();
+            case RepositoryProperties.TYPE_VIRTUOSO -> getVirtuosoRepository();
             default -> null;
         };
 
@@ -161,6 +183,81 @@ public class RepositoryConfig {
             log.error("Failed to connect to GraphDB");
         }
         return null;
+    }
+
+    private Repository getVirtuosoRepository() {
+        log.info("Setting up Virtuoso Store");
+        String virtuosoUrl = repositoryProperties.getVirtuoso().getUrl();
+        if (!virtuosoUrl.isEmpty()) {
+            virtuosoUrl = removeLastSlash(virtuosoUrl);
+            final SPARQLRepository repository =
+                    new SPARQLRepository(virtuosoUrl + "/sparql-auth");
+            final String username = repositoryProperties.getVirtuoso().getUsername();
+            final String password = repositoryProperties.getVirtuoso().getPassword();
+            if (!username.isEmpty() && !password.isEmpty()) {
+                final URI uri = URI.create(virtuosoUrl);
+                final CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
+                credentialsProvider.setCredentials(
+                        new AuthScope(uri.getHost(), uri.getPort()),
+                        new UsernamePasswordCredentials(username, password)
+                );
+                final HttpClient httpClient = HttpClients.custom()
+                        .setDefaultCredentialsProvider(credentialsProvider)
+                        .addInterceptorFirst(new StripTrailingSparqlUpdateSemicolonInterceptor())
+                        .build();
+                repository.setHttpClient(httpClient);
+            }
+            return repository;
+        }
+        log.warn("'repository.virtuoso.url' is empty");
+        return null;
+    }
+
+    /**
+     * RDF4J's SPARQLConnection always appends "; " after every SPARQL Update
+     * statement it sends -- harmless for GraphDB/Blazegraph/AllegroGraph, but
+     * Virtuoso's stricter SPARQL compiler rejects it outright (SP030 syntax
+     * error). Strips the trailing semicolon from the "update" form parameter
+     * before the request goes out.
+     *
+     * Must be registered via addInterceptorFirst, not addInterceptorLast:
+     * running after Apache HttpClient's own RequestContent interceptor (which
+     * computes Content-Length from the pre-stripped entity) causes a body/
+     * header mismatch that manifests as a slow NoHttpResponseException on the
+     * following Digest retry, not an immediate, obvious error.
+     *
+     * The rebuilt entity is always set unconditionally, even when nothing
+     * changed -- conditionally replacing it only when the semicolon was found
+     * caused a stale, already-consumed entity to be resent on a Digest retry.
+     */
+    private static final class StripTrailingSparqlUpdateSemicolonInterceptor implements HttpRequestInterceptor {
+        @Override
+        public void process(HttpRequest request, HttpContext context) throws IOException {
+            if (!(request instanceof HttpEntityEnclosingRequest enclosingRequest)) {
+                return;
+            }
+            final HttpEntity entity = enclosingRequest.getEntity();
+            if (entity == null || entity.getContentType() == null
+                    || !entity.getContentType().getValue().startsWith("application/x-www-form-urlencoded")) {
+                return;
+            }
+
+            final List<NameValuePair> params = URLEncodedUtils.parse(entity);
+            final List<NameValuePair> rebuilt = new ArrayList<>();
+            for (final NameValuePair param : params) {
+                if ("update".equals(param.getName()) && param.getValue() != null) {
+                    rebuilt.add(new BasicNameValuePair(
+                            param.getName(),
+                            param.getValue().replaceFirst(";\\s*$", "")
+                    ));
+                }
+                else {
+                    rebuilt.add(param);
+                }
+            }
+            EntityUtils.consume(entity);
+            enclosingRequest.setEntity(new UrlEncodedFormEntity(rebuilt, StandardCharsets.UTF_8));
+        }
     }
 
 }
