@@ -19,6 +19,12 @@ RUN mvn --quiet --batch-mode --update-snapshots --fail-fast -DskipTests -Drevisi
 
 FROM eclipse-temurin:21-jdk-alpine
 
+# Pick up whatever OS package security fixes Alpine has published since this base
+# image was last rebuilt -- eclipse-temurin's own image lags its own upstream Alpine
+# repo by days/weeks, so patched packages are often already available even when the
+# base image tag itself hasn't been refreshed.
+RUN apk update && apk upgrade --no-cache
+
 # add non-root user to run the app
 # https://spring.io/guides/gs/spring-boot-docker
 RUN addgroup -S spring && adduser -S spring -G spring
